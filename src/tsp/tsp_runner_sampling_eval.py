@@ -1,9 +1,10 @@
 # --------------------------------------------------
 # Clean experiment runner for TSP (PAPER-READY, DDP)
 # - entropy schedule (TRAINING ONLY)
+# - EMA baseline for STRONGER advantage signal
 # - sampling-only multi-start evaluation (NO entropy)
 # - CLEAN LOGGING + ROUNDED VALUES
-#   * train CSV: step, loss, avg_tour, entropy_coef
+#   * train CSV: step, loss, avg_tour, entropy_coef, ema_baseline
 #   * eval  CSV: eval_avg_tour, inference_ms
 # - Kaggle GPU–safe
 # - DDP-enabled (torchrun)
@@ -30,7 +31,7 @@ def entropy_schedule(step, total_steps, start, end):
 
 
 # --------------------------------------------------
-# Training (sampling + entropy regularization)
+# Training (sampling + entropy + EMA baseline)
 # --------------------------------------------------
 
 def train(model, opt, device, args, is_main, train_log_path):
@@ -41,6 +42,10 @@ def train(model, opt, device, args, is_main, train_log_path):
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    # 🔥 EMA baseline state (rank-0 only)
+    ema_baseline = None
+    ema_beta = args.ema_beta
 
     writer = None
     csv_file = None
@@ -55,9 +60,16 @@ def train(model, opt, device, args, is_main, train_log_path):
             # SAMPLE during training
             logp, ent, length = net.rollout(coords, greedy=False)
 
-            # greedy baseline (no grad)
+            # ---- EMA BASELINE UPDATE (NO GRAD) ----
             with torch.no_grad():
-                _, _, greedy_len = net.rollout(coords, greedy=True)
+                batch_mean = length.mean().item()
+                if ema_baseline is None:
+                    ema_baseline = batch_mean
+                else:
+                    ema_baseline = (
+                        ema_beta * ema_baseline
+                        + (1.0 - ema_beta) * batch_mean
+                    )
 
             entropy_coef = entropy_schedule(
                 step,
@@ -66,8 +78,9 @@ def train(model, opt, device, args, is_main, train_log_path):
                 args.entropy_end,
             )
 
-            # REINFORCE-style loss
-            loss = ((length - greedy_len) * logp).mean() - entropy_coef * ent.mean()
+            # 🔥 STRONGER ADVANTAGE SIGNAL
+            advantage = length - ema_baseline
+            loss = (advantage * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -85,7 +98,8 @@ def train(model, opt, device, args, is_main, train_log_path):
                 f"step {step:04d} | "
                 f"loss {loss_val:.4f} | "
                 f"tour {avg_tour:.3f} | "
-                f"entropy {entropy_coef:.4f}"
+                f"entropy {entropy_coef:.4f} | "
+                f"ema {ema_baseline:.3f}"
             )
 
             writer.writerow([
@@ -93,6 +107,7 @@ def train(model, opt, device, args, is_main, train_log_path):
                 round(loss_val, 6),
                 round(avg_tour, 6),
                 round(entropy_coef, 6),
+                round(ema_baseline, 6),
             ])
             csv_file.flush()
 
@@ -159,7 +174,10 @@ def run(args):
             f"📦 Config: N={args.n_nodes}, dim={args.dim}, "
             f"layers={args.layers}, batch={args.batch}"
         )
-        print(f"🔁 Eval: sampling-only, k={args.eval_k}\n")
+        print(
+            f"🔁 Eval: sampling-only, k={args.eval_k} | "
+            f"EMA beta={args.ema_beta}\n"
+        )
 
     model = TSPModel(dim=args.dim, layers=args.layers).to(device)
 
@@ -186,7 +204,13 @@ def run(args):
     if is_main:
         with open(train_log, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "loss", "avg_tour", "entropy_coef"])
+            writer.writerow([
+                "step",
+                "loss",
+                "avg_tour",
+                "entropy_coef",
+                "ema_baseline",
+            ])
 
     train(model, opt, device, args, is_main, train_log)
 
@@ -215,7 +239,6 @@ def run(args):
 # --------------------------------------------------
 # CLI
 # --------------------------------------------------
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -230,7 +253,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--entropy_start", type=float, default=0.05)
-    parser.add_argument("--entropy_end", type=float, default=0.005)
+    parser.add_argument("--entropy_end", type=float, default=0.02)
+    parser.add_argument("--ema_beta", type=float, default=0.99)
     parser.add_argument("--log_every", type=int, default=50)
 
     args = parser.parse_args()
