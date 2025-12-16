@@ -47,7 +47,7 @@ def train(model, opt, device, args, device_name, train_writer):
     for step in range(args.steps):
         coords = torch.rand(args.batch, args.n_nodes, 2, device=device)
 
-        with torch.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
             logp, ent, length = model.rollout(coords, greedy=False)
 
             with torch.no_grad():
