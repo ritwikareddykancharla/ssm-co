@@ -2,7 +2,8 @@
 # Curriculum TSP Trainer (DDP, FAST)
 # - SINGLE fixed-size model
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - EMA baseline
+# - NO EMA baseline
+# - OPTIONAL Greedy baseline (recommended)
 # - Entropy regularization (training only)
 # - Sampling-only evaluation (rank 0)
 # --------------------------------------------------
@@ -40,18 +41,16 @@ def train_stage(
     batch,
     entropy_start,
     entropy_end,
-    ema_beta,
     log_every,
     log_path,
     is_main,
+    use_greedy_baseline=True,   # toggle
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
-
-    ema_baseline = None
 
     writer = None
     if is_main:
@@ -63,28 +62,27 @@ def train_stage(
             "loss",
             "avg_tour",
             "entropy_coef",
-            "ema_baseline",
         ])
 
     for step in range(steps):
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            # --- sampled rollout ---
             logp, ent, length = net.rollout(coords, greedy=False)
 
-            # EMA baseline (local, rank-0 only is enough)
-            with torch.no_grad():
-                mean_len = length.mean().item()
-                ema_baseline = (
-                    mean_len if ema_baseline is None
-                    else ema_beta * ema_baseline + (1 - ema_beta) * mean_len
-                )
+            # --- greedy baseline (NO GRAD) ---
+            if use_greedy_baseline:
+                with torch.no_grad():
+                    _, _, greedy_len = net.rollout(coords, greedy=True)
+                advantage = length - greedy_len
+            else:
+                advantage = length   # pure REINFORCE
 
             entropy_coef = entropy_schedule(
                 step, steps, entropy_start, entropy_end
             )
 
-            advantage = length - ema_baseline
             loss = (advantage * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
@@ -96,21 +94,22 @@ def train_stage(
             sync("cuda")
 
             if is_main:
+                avg_tour = length.mean().item()
+                loss_val = loss.item()
+
                 writer.writerow([
                     step,
                     n_nodes,
-                    round(loss.item(), 6),
-                    round(length.mean().item(), 6),
+                    round(loss_val, 6),
+                    round(avg_tour, 6),
                     round(entropy_coef, 6),
-                    round(ema_baseline, 6),
                 ])
                 f.flush()
 
                 print(
                     f"[TRAIN][N={n_nodes}] "
                     f"step {step:05d} | "
-                    f"tour {length.mean():.3f} | "
-                    f"ema {ema_baseline:.3f} | "
+                    f"tour {avg_tour:.3f} | "
                     f"entropy {entropy_coef:.3f}"
                 )
 
@@ -160,16 +159,11 @@ def main():
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
-
-    parser.add_argument("--entropy_start", type=float, default=0.05)
-    parser.add_argument("--entropy_end", type=float, default=0.02)
-    parser.add_argument("--ema_beta", type=float, default=0.99)
-
     parser.add_argument("--log_every", type=int, default=10)
 
     args = parser.parse_args()
 
-    # ---------------- DDP SETUP ----------------
+    # ---------------- DDP ----------------
     is_ddp = "RANK" in os.environ
 
     if is_ddp:
@@ -200,15 +194,16 @@ def main():
 
     # ---------------- CURRICULUM ----------------
     curriculum = [
-        dict(N=10,  steps=3000),
-        dict(N=20,  steps=10000),
-        dict(N=50,  steps=20000),
-        dict(N=100, steps=30000),
+        dict(N=10,  steps=3000,  ent=(0.05, 0.02)),
+        dict(N=20,  steps=10000, ent=(0.08, 0.03)),
+        dict(N=50,  steps=20000, ent=(0.10, 0.04)),
+        dict(N=100, steps=30000, ent=(0.12, 0.05)),
     ]
 
     for stage in curriculum:
         N = stage["N"]
         steps = stage["steps"]
+        ent_start, ent_end = stage["ent"]
 
         if is_main:
             print(f"\n Training TSP{N} for {steps} steps")
@@ -222,12 +217,12 @@ def main():
             n_nodes=N,
             steps=steps,
             batch=args.batch,
-            entropy_start=args.entropy_start,
-            entropy_end=args.entropy_end,
-            ema_beta=args.ema_beta,
+            entropy_start=ent_start,
+            entropy_end=ent_end,
             log_every=args.log_every,
             log_path=train_log,
             is_main=is_main,
+            use_greedy_baseline=True,  # keep this ON
         )
 
         if is_main:
