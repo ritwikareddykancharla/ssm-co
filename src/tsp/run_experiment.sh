@@ -122,6 +122,6 @@ torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --lr $LR
 
 echo "======================================"
-echo "All experiments finished 💅"
+echo "All experiments finished"
 echo "Logs saved in logs/"
 echo "======================================"
