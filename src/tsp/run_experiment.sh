@@ -21,6 +21,10 @@ LR=1e-4
 # Sampling runs at evaluation (best-of-k)
 EVAL_K=32
 
+# 🔥 ENTROPY (THIS IS WHAT YOU ASKED FOR)
+ENTROPY_START=0.05
+ENTROPY_END=0.02
+
 LOG_EVERY=10
 NUM_GPUS=2
 
@@ -30,6 +34,7 @@ echo "======================================"
 echo "Running Sequential TSP Experiments (DDP)"
 echo "dim=$DIM layers=$LAYERS steps=$STEPS batch/gpu=$BATCH_PER_GPU gpus=$NUM_GPUS"
 echo "eval: sampling-only (k=$EVAL_K)"
+echo "entropy: start=$ENTROPY_START end=$ENTROPY_END"
 echo "======================================"
 
 # -------- TSP 10 --------
@@ -41,6 +46,8 @@ torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
+  --entropy_start $ENTROPY_START \
+  --entropy_end $ENTROPY_END \
   --log_every $LOG_EVERY \
   --lr $LR
 
@@ -53,6 +60,8 @@ torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
+  --entropy_start $ENTROPY_START \
+  --entropy_end $ENTROPY_END \
   --log_every $LOG_EVERY \
   --lr $LR
 
@@ -65,6 +74,8 @@ torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
+  --entropy_start $ENTROPY_START \
+  --entropy_end $ENTROPY_END \
   --log_every $LOG_EVERY \
   --lr $LR
 
@@ -77,10 +88,12 @@ torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
+  --entropy_start $ENTROPY_START \
+  --entropy_end $ENTROPY_END \
   --log_every $LOG_EVERY \
   --lr $LR
 
 echo "======================================"
-echo "All experiments finished"
+echo "All experiments finished 💅"
 echo "Logs saved in logs/"
 echo "======================================"
