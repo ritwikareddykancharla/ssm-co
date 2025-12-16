@@ -8,7 +8,7 @@ python run_experiment.py \
   --dim 256 \
   --layers 4 \
   --batch 512 \
-  --steps 10000 \
+  --steps 1000 \
   --eval_k 16
 
 python run_experiment.py \
@@ -16,5 +16,5 @@ python run_experiment.py \
   --dim 256 \
   --layers 4 \
   --batch 256 \
-  --steps 10000 \
+  --steps 1000 \
   --eval_k 16
