@@ -36,6 +36,9 @@ def entropy_schedule(step, total_steps, start, end):
 def train(model, opt, device, args, is_main):
     model.train()
 
+    # IMPORTANT: unwrap DDP for custom methods
+    net = model.module if hasattr(model, "module") else model
+
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
@@ -43,10 +46,10 @@ def train(model, opt, device, args, is_main):
         coords = torch.rand(args.batch, args.n_nodes, 2, device=device)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            logp, ent, length = model.rollout(coords, greedy=False)
+            logp, ent, length = net.rollout(coords, greedy=False)
 
             with torch.no_grad():
-                _, _, greedy_len = model.rollout(coords, greedy=True)
+                _, _, greedy_len = net.rollout(coords, greedy=True)
 
             entropy_coef = entropy_schedule(
                 step,
@@ -74,12 +77,15 @@ def train(model, opt, device, args, is_main):
 
 
 # --------------------------------------------------
-# Evaluation (single-GPU, rank 0 only)
+# Evaluation (rank 0 only)
 # --------------------------------------------------
 @torch.no_grad()
 
 def evaluate(model, device, args):
     model.eval()
+
+    # IMPORTANT: unwrap DDP for custom methods
+    net = model.module if hasattr(model, "module") else model
 
     tours = []
     times = []
@@ -91,7 +97,7 @@ def evaluate(model, device, args):
         start = time.perf_counter()
 
         for _ in range(args.eval_k):
-            _, _, length = model.rollout(
+            _, _, length = net.rollout(
                 coords, greedy=not args.sample_eval
             )
             mean_len = length.mean().item()
