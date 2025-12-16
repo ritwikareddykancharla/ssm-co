@@ -9,7 +9,7 @@
 # ---------------- CONFIG ----------------
 DIM=256
 LAYERS=4
-STEPS=1000
+STEPS=3000
 
 # IMPORTANT:
 # Batch is PER GPU in DDP
