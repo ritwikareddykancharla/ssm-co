@@ -1,9 +1,9 @@
 # --------------------------------------------------
 # Clean experiment runner for TSP (PAPER-READY, DDP)
-# - entropy schedule (training)
-# - multi-start evaluation (k rollouts)
+# - entropy schedule (TRAINING ONLY)
+# - sampling-only multi-start evaluation (NO entropy)
 # - CLEAN LOGGING + ROUNDED VALUES
-#   * train CSV: step, loss, avg_tour, entropy
+#   * train CSV: step, loss, avg_tour, entropy_coef
 #   * eval  CSV: eval_avg_tour, inference_ms
 # - Kaggle GPU–safe
 # - DDP-enabled (torchrun)
@@ -21,7 +21,7 @@ from utils.device import sync
 
 
 # --------------------------------------------------
-# Entropy schedule
+# Entropy schedule (TRAINING ONLY)
 # --------------------------------------------------
 
 def entropy_schedule(step, total_steps, start, end):
@@ -30,24 +30,32 @@ def entropy_schedule(step, total_steps, start, end):
 
 
 # --------------------------------------------------
-# Training
+# Training (sampling + entropy regularization)
 # --------------------------------------------------
 
-def train(model, opt, device, args, is_main):
+def train(model, opt, device, args, is_main, train_log_path):
     model.train()
 
-    # IMPORTANT: unwrap DDP for custom methods
+    # unwrap DDP for custom methods
     net = model.module if hasattr(model, "module") else model
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
+    writer = None
+    csv_file = None
+    if is_main:
+        csv_file = open(train_log_path, "a", newline="")
+        writer = csv.writer(csv_file)
+
     for step in range(args.steps):
         coords = torch.rand(args.batch, args.n_nodes, 2, device=device)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            # SAMPLE during training
             logp, ent, length = net.rollout(coords, greedy=False)
 
+            # greedy baseline (no grad)
             with torch.no_grad():
                 _, _, greedy_len = net.rollout(coords, greedy=True)
 
@@ -58,6 +66,7 @@ def train(model, opt, device, args, is_main):
                 args.entropy_end,
             )
 
+            # REINFORCE-style loss
             loss = ((length - greedy_len) * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
@@ -67,27 +76,43 @@ def train(model, opt, device, args, is_main):
 
         if step % args.log_every == 0 and is_main:
             sync("cuda")
+
+            avg_tour = length.mean().item()
+            loss_val = loss.item()
+
             print(
                 f"[TRAIN][N={args.n_nodes}] "
                 f"step {step:04d} | "
-                f"loss {loss.item():.4f} | "
-                f"tour {length.mean().item():.3f} | "
+                f"loss {loss_val:.4f} | "
+                f"tour {avg_tour:.3f} | "
                 f"entropy {entropy_coef:.4f}"
             )
 
+            writer.writerow([
+                step,
+                round(loss_val, 6),
+                round(avg_tour, 6),
+                round(entropy_coef, 6),
+            ])
+            csv_file.flush()
+
+    if csv_file is not None:
+        csv_file.close()
+
 
 # --------------------------------------------------
-# Evaluation (rank 0 only)
+# Evaluation (sampling-only, NO entropy, rank 0)
 # --------------------------------------------------
+
 @torch.no_grad()
 
 def evaluate(model, device, args):
     model.eval()
 
-    # IMPORTANT: unwrap DDP for custom methods
+    # unwrap DDP
     net = model.module if hasattr(model, "module") else model
 
-    tours = []
+    tour_vals = []
     times = []
 
     for _ in range(args.eval_batches):
@@ -96,20 +121,19 @@ def evaluate(model, device, args):
         best_len = None
         start = time.perf_counter()
 
+        # multi-start SAMPLING
         for _ in range(args.eval_k):
-            _, _, length = net.rollout(
-                coords, greedy=not args.sample_eval
-            )
+            _, _, length = net.rollout(coords, greedy=False)
             mean_len = length.mean().item()
             best_len = mean_len if best_len is None else min(best_len, mean_len)
 
         sync("cuda")
         end = time.perf_counter()
 
-        tours.append(best_len)
+        tour_vals.append(best_len)
         times.append((end - start) * 1000.0)
 
-    return sum(tours) / len(tours), sum(times) / len(times)
+    return sum(tour_vals) / len(tour_vals), sum(times) / len(times)
 
 
 # --------------------------------------------------
@@ -135,10 +159,7 @@ def run(args):
             f"📦 Config: N={args.n_nodes}, dim={args.dim}, "
             f"layers={args.layers}, batch={args.batch}"
         )
-        print(
-            f"🔁 Eval: k={args.eval_k}, "
-            f"{'sampling' if args.sample_eval else 'greedy'}\n"
-        )
+        print(f"🔁 Eval: sampling-only, k={args.eval_k}\n")
 
     model = TSPModel(dim=args.dim, layers=args.layers).to(device)
 
@@ -165,9 +186,9 @@ def run(args):
     if is_main:
         with open(train_log, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "loss", "avg_tour", "entropy"])
+            writer.writerow(["step", "loss", "avg_tour", "entropy_coef"])
 
-    train(model, opt, device, args, is_main)
+    train(model, opt, device, args, is_main, train_log)
 
     if is_main:
         avg_tour, avg_time = evaluate(model, device, args)
@@ -194,6 +215,7 @@ def run(args):
 # --------------------------------------------------
 # CLI
 # --------------------------------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -204,9 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--eval_batches", type=int, default=20)
-
-    parser.add_argument("--eval_k", type=int, default=8)
-    parser.add_argument("--sample_eval", action="store_true")
+    parser.add_argument("--eval_k", type=int, default=32)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--entropy_start", type=float, default=0.05)

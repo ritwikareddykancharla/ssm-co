@@ -1,8 +1,9 @@
 #!/bin/bash
 # ==================================================
 # Sequential TSP Experiments (DDP, Kaggle 2×GPU)
-# Uses BOTH GPUs via torchrun
-# Same model, different N (sequential)
+# - Sampling-only evaluation (multi-start)
+# - Entropy regularization ONLY during training
+# - Paper-ready, clean baselines
 # ==================================================
 
 # ---------------- CONFIG ----------------
@@ -12,65 +13,74 @@ STEPS=1000
 
 # IMPORTANT:
 # Batch is PER GPU in DDP
-# Effective batch = BATCH_PER_GPU × 2
-BATCH_PER_GPU=256
+# Effective batch = BATCH_PER_GPU × NUM_GPUS
+BATCH_PER_GPU=512
 
 LR=1e-4
-EVAL_K=16
-LOG_EVERY=10
 
+# Sampling runs at evaluation (best-of-k)
+EVAL_K=32
+
+LOG_EVERY=10
 NUM_GPUS=2
+
+RUNNER=tsp_runner_sampling_eval.py
 
 echo "======================================"
 echo "Running Sequential TSP Experiments (DDP)"
 echo "dim=$DIM layers=$LAYERS steps=$STEPS batch/gpu=$BATCH_PER_GPU gpus=$NUM_GPUS"
+echo "eval: sampling-only (k=$EVAL_K)"
 echo "======================================"
 
 # -------- TSP 10 --------
-echo "\n TSP N=10"
-torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
+echo -e "\n TSP N=10"
+torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --n_nodes 10 \
   --dim $DIM \
   --layers $LAYERS \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
-  --log_every $LOG_EVERY
+  --log_every $LOG_EVERY \
+  --lr $LR
 
 # -------- TSP 20 --------
-echo "\n TSP N=20"
-torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
+echo -e "\n TSP N=20"
+torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --n_nodes 20 \
   --dim $DIM \
   --layers $LAYERS \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
-  --log_every $LOG_EVERY
+  --log_every $LOG_EVERY \
+  --lr $LR
 
 # -------- TSP 50 --------
-echo "\n TSP N=50"
-torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
+echo -e "\n TSP N=50"
+torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --n_nodes 50 \
   --dim $DIM \
   --layers $LAYERS \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
-  --log_every $LOG_EVERY
+  --log_every $LOG_EVERY \
+  --lr $LR
 
 # -------- TSP 100 --------
-echo "\n TSP N=100"
-torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
+echo -e "\n TSP N=100"
+torchrun --nproc_per_node=$NUM_GPUS $RUNNER \
   --n_nodes 100 \
   --dim $DIM \
   --layers $LAYERS \
   --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
-  --log_every $LOG_EVERY
+  --log_every $LOG_EVERY \
+  --lr $LR
 
 echo "======================================"
-echo "All experiments finished 💅"
+echo "All experiments finished"
 echo "Logs saved in logs/"
 echo "======================================"
