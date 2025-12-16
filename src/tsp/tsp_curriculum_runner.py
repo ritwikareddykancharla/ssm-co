@@ -165,7 +165,7 @@ def main():
     parser.add_argument("--entropy_end", type=float, default=0.02)
     parser.add_argument("--ema_beta", type=float, default=0.99)
 
-    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--log_every", type=int, default=10)
 
     args = parser.parse_args()
 
@@ -183,7 +183,7 @@ def main():
         is_main = True
 
     if is_main:
-        print(f"\n🚀 Device: {device}")
+        print(f"\n Device: {device}")
         os.makedirs("logs", exist_ok=True)
 
     # ---------------- MODEL ----------------
@@ -211,7 +211,7 @@ def main():
         steps = stage["steps"]
 
         if is_main:
-            print(f"\n🔥 Training TSP{N} for {steps} steps")
+            print(f"\n Training TSP{N} for {steps} steps")
 
         train_log = f"logs/tsp_curriculum_N{N}_train.csv"
 
