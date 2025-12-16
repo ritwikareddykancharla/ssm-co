@@ -158,7 +158,7 @@ def main():
     parser.add_argument("--entropy_end", type=float, default=0.02)
     parser.add_argument("--ema_beta", type=float, default=0.99)
 
-    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--log_every", type=int, default=10)
 
     args = parser.parse_args()
 
