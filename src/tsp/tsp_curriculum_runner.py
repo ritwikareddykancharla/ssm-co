@@ -1,114 +1,100 @@
 # --------------------------------------------------
-# Curriculum Training Runner for TSP (PAPER-READY)
-# - SINGLE model trained across increasing N
-# - Hybrid baseline: greedy + EMA
-# - Entropy schedule per stage
-# - Sampling-only multi-start evaluation
+# Curriculum TSP Trainer (PAPER-READY)
+# - SINGLE fixed-size model
+# - Curriculum over N (10 → 20 → 50 → 100)
+# - EMA baseline (strong advantage signal)
+# - Entropy regularization (training only)
+# - Sampling-only evaluation
+# - CLEAN CSV logs
 # --------------------------------------------------
 
+import argparse
 import csv
 import os
 import time
 import torch
-import torch.nn as nn
 
 from model import TSPModel
 from utils.device import sync
 
 
-# ---------------- Curriculum ----------------
+# --------------------------------------------------
+# Entropy schedule (per stage)
+# --------------------------------------------------
 
-CURRICULUM = [
-    dict(n=10,  steps=2000,  layers=4, entropy_end=0.02),
-    dict(n=20,  steps=10000, layers=4, entropy_end=0.01),
-    dict(n=50,  steps=20000, layers=5, entropy_end=0.005),
-    dict(n=100, steps=30000, layers=6, entropy_end=0.002),
-]
-
-DIM = 256
-BATCH = 512
-LR = 1e-4
-EMA_BETA = 0.99
-ENTROPY_START = 0.05
-EVAL_K = 32
-LOG_EVERY = 50
-
-
-# ---------------- Utils ----------------
-
-def entropy_schedule(step, total, start, end):
-    frac = step / total
+def entropy_schedule(step, total_steps, start, end):
+    frac = step / total_steps
     return start * (1 - frac) + end * frac
 
 
-def expand_model(old_model, new_layers):
-    """Safely increase depth while preserving weights."""
-    if old_model.layers == new_layers:
-        return old_model
+# --------------------------------------------------
+# Train ONE stage
+# --------------------------------------------------
 
-    print(f" Expanding model: {old_model.layers} → {new_layers} layers")
-
-    new_model = TSPModel(dim=DIM, layers=new_layers)
-    new_model.load_state_dict(old_model.state_dict(), strict=False)
-    return new_model
-
-
-# ---------------- Training ----------------
-
-def train_stage(model, optimizer, stage, device, ema_baseline):
-    n = stage["n"]
-    steps = stage["steps"]
-    entropy_end = stage["entropy_end"]
-
+def train_stage(
+    model,
+    opt,
+    device,
+    n_nodes,
+    steps,
+    batch,
+    entropy_start,
+    entropy_end,
+    ema_beta,
+    log_every,
+    log_path,
+):
     model.train()
     net = model
 
-    os.makedirs("logs", exist_ok=True)
-    train_log = f"logs/tsp_N{n}_train.csv"
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
 
-    with open(train_log, "w", newline="") as f:
+    ema_baseline = None
+
+    with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["step", "loss", "avg_tour", "entropy", "ema"])
+        writer.writerow([
+            "step",
+            "n_nodes",
+            "loss",
+            "avg_tour",
+            "entropy_coef",
+            "ema_baseline",
+        ])
 
         for step in range(steps):
-            coords = torch.rand(BATCH, n, 2, device=device)
+            coords = torch.rand(batch, n_nodes, 2, device=device)
 
-            logp, ent, length = net.rollout(coords, greedy=False)
-            with torch.no_grad():
-                _, _, greedy_len = net.rollout(coords, greedy=True)
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                logp, ent, length = net.rollout(coords, greedy=False)
 
-                batch_mean = length.mean().item()
-                if ema_baseline is None:
-                    ema_baseline = batch_mean
-                else:
-                    ema_baseline = EMA_BETA * ema_baseline + (1 - EMA_BETA) * batch_mean
+                # EMA baseline
+                with torch.no_grad():
+                    mean_len = length.mean().item()
+                    ema_baseline = (
+                        mean_len if ema_baseline is None
+                        else ema_beta * ema_baseline + (1 - ema_beta) * mean_len
+                    )
 
-            baseline = torch.minimum(
-                greedy_len,
-                torch.tensor(ema_baseline, device=device)
-            )
-
-            entropy_coef = entropy_schedule(
-                step, steps, ENTROPY_START, entropy_end
-            )
-
-            loss = ((length - baseline) * logp).mean() - entropy_coef * ent.mean()
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            if step % LOG_EVERY == 0:
-                sync("cuda")
-                print(
-                    f"[N={n}] step {step:05d} | "
-                    f"tour {length.mean():.3f} | "
-                    f"entropy {entropy_coef:.4f} | "
-                    f"ema {ema_baseline:.3f}"
+                entropy_coef = entropy_schedule(
+                    step, steps, entropy_start, entropy_end
                 )
+
+                advantage = length - ema_baseline
+                loss = (advantage * logp).mean() - entropy_coef * ent.mean()
+
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            if step % log_every == 0:
+                sync("cuda")
 
                 writer.writerow([
                     step,
+                    n_nodes,
                     round(loss.item(), 6),
                     round(length.mean().item(), 6),
                     round(entropy_coef, 6),
@@ -116,62 +102,118 @@ def train_stage(model, optimizer, stage, device, ema_baseline):
                 ])
                 f.flush()
 
-    return ema_baseline
+                print(
+                    f"[TRAIN][N={n_nodes}] "
+                    f"step {step:05d} | "
+                    f"tour {length.mean():.3f} | "
+                    f"ema {ema_baseline:.3f} | "
+                    f"entropy {entropy_coef:.3f}"
+                )
 
 
-# ---------------- Evaluation ----------------
+# --------------------------------------------------
+# Evaluation (sampling-only)
+# --------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, n, device):
+def evaluate(model, device, n_nodes, batch, eval_k, eval_batches):
     model.eval()
     net = model
 
-    tours = []
-    times = []
+    tours, times = [], []
 
-    for _ in range(20):
-        coords = torch.rand(BATCH, n, 2, device=device)
+    for _ in range(eval_batches):
+        coords = torch.rand(batch, n_nodes, 2, device=device)
+
         best = None
         start = time.perf_counter()
 
-        for _ in range(EVAL_K):
+        for _ in range(eval_k):
             _, _, length = net.rollout(coords, greedy=False)
-            m = length.mean().item()
-            best = m if best is None else min(best, m)
+            val = length.mean().item()
+            best = val if best is None else min(best, val)
 
         sync("cuda")
-        times.append((time.perf_counter() - start) * 1000)
+        end = time.perf_counter()
+
         tours.append(best)
+        times.append((end - start) * 1000)
 
     return sum(tours) / len(tours), sum(times) / len(times)
 
 
-# ---------------- Main ----------------
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--dim", type=int, default=256)
+    parser.add_argument("--layers", type=int, default=6)
+    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-4)
+
+    parser.add_argument("--entropy_start", type=float, default=0.05)
+    parser.add_argument("--entropy_end", type=float, default=0.02)
+    parser.add_argument("--ema_beta", type=float, default=0.99)
+
+    parser.add_argument("--log_every", type=int, default=50)
+
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n Device: {device}\n")
+    print(f"\n Device: {device}")
 
-    model = TSPModel(dim=DIM, layers=CURRICULUM[0]["layers"]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    os.makedirs("logs", exist_ok=True)
 
-    ema_baseline = None
+    # FIXED BIG MODEL
+    model = TSPModel(dim=args.dim, layers=args.layers).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    for stage in CURRICULUM:
-        model = expand_model(model, stage["layers"]).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # CURRICULUM (ONLY N CHANGES)
+    curriculum = [
+        dict(N=10,  steps=3000),
+        dict(N=20,  steps=10000),
+        dict(N=50,  steps=20000),
+        dict(N=100, steps=30000),
+    ]
 
-        print(f"\n Curriculum stage: N={stage['n']} ({stage['steps']} steps)\n")
+    for stage in curriculum:
+        N = stage["N"]
+        steps = stage["steps"]
 
-        ema_baseline = train_stage(
-            model, optimizer, stage, device, ema_baseline
+        print(f"\n Training TSP{N} for {steps} steps")
+
+        train_log = f"logs/tsp_curriculum_N{N}_train.csv"
+
+        train_stage(
+            model=model,
+            opt=opt,
+            device=device,
+            n_nodes=N,
+            steps=steps,
+            batch=args.batch,
+            entropy_start=args.entropy_start,
+            entropy_end=args.entropy_end,
+            ema_beta=args.ema_beta,
+            log_every=args.log_every,
+            log_path=train_log,
         )
 
-        avg_tour, avg_time = evaluate(model, stage["n"], device)
+        avg_tour, avg_time = evaluate(
+            model,
+            device,
+            n_nodes=N,
+            batch=args.batch,
+            eval_k=32,
+            eval_batches=20,
+        )
 
         print(
-            f"\n📊 Eval N={stage['n']} | "
-            f"tour={avg_tour:.3f} | time={avg_time:.1f} ms\n"
+            f"📊 Eval TSP{N} | "
+            f"tour={avg_tour:.3f} | "
+            f"time={avg_time:.1f} ms"
         )
 
 
