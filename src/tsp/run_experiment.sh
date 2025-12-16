@@ -1,59 +1,71 @@
 #!/bin/bash
 # ==================================================
-# Sequential TSP Experiments (TPU / GPU / CPU)
-# Same model, different N
+# Sequential TSP Experiments (DDP, Kaggle 2×GPU)
+# Uses BOTH GPUs via torchrun
+# Same model, different N (sequential)
 # ==================================================
 
+# ---------------- CONFIG ----------------
 DIM=256
 LAYERS=4
-STEPS=10000
-BATCH=512        # TPU-friendly (use 512 if OOM)
-LR=1e-4
+STEPS=1000
 
+# IMPORTANT:
+# Batch is PER GPU in DDP
+# Effective batch = BATCH_PER_GPU × 2
+BATCH_PER_GPU=256
+
+LR=1e-4
 EVAL_K=16
 LOG_EVERY=10
 
+NUM_GPUS=2
+
 echo "======================================"
-echo "Running Sequential TSP Experiments"
-echo "dim=$DIM layers=$LAYERS steps=$STEPS batch=$BATCH"
+echo "Running Sequential TSP Experiments (DDP)"
+echo "dim=$DIM layers=$LAYERS steps=$STEPS batch/gpu=$BATCH_PER_GPU gpus=$NUM_GPUS"
 echo "======================================"
 
 # -------- TSP 10 --------
-python run_experiment.py \
+echo "\n TSP N=10"
+torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
   --n_nodes 10 \
   --dim $DIM \
   --layers $LAYERS \
-  --batch $BATCH \
+  --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
   --log_every $LOG_EVERY
 
 # -------- TSP 20 --------
-python run_experiment.py \
+echo "\n TSP N=20"
+torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
   --n_nodes 20 \
   --dim $DIM \
   --layers $LAYERS \
-  --batch $BATCH \
+  --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
   --log_every $LOG_EVERY
 
 # -------- TSP 50 --------
-python run_experiment.py \
+echo "\n TSP N=50"
+torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
   --n_nodes 50 \
   --dim $DIM \
   --layers $LAYERS \
-  --batch $BATCH \
+  --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
   --log_every $LOG_EVERY
 
 # -------- TSP 100 --------
-python run_experiment.py \
+echo "\n TSP N=100"
+torchrun --nproc_per_node=$NUM_GPUS run_experiment.py \
   --n_nodes 100 \
   --dim $DIM \
   --layers $LAYERS \
-  --batch $BATCH \
+  --batch $BATCH_PER_GPU \
   --steps $STEPS \
   --eval_k $EVAL_K \
   --log_every $LOG_EVERY
