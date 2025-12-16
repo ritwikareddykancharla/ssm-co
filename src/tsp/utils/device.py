@@ -1,6 +1,7 @@
-# utils/device.py
 # --------------------------------------------------
-# Unified device selection for CPU / CUDA / TPU
+# Unified device utilities for CPU / CUDA / TPU
+# - Safe on Kaggle (no torch_xla import unless TPU)
+# - Correct synchronization for timing
 # --------------------------------------------------
 
 import torch
@@ -48,10 +49,12 @@ def optimizer_step(optimizer, device: str):
 
 def sync(device: str):
     """
-    Synchronizes device for correct timing/logging.
+    Synchronizes device for correct timing / logging.
     """
     device = device.lower()
 
     if device == "tpu":
         import torch_xla.core.xla_model as xm
         xm.mark_step()
+    elif device == "cuda":
+        torch.cuda.synchronize()

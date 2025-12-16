@@ -1,6 +1,7 @@
-# tsp_toy.py
 # --------------------------------------------------
 # Minimal TSP model + rollout (device-agnostic)
+# - GPU-optimized (no TPU/XLA assumptions)
+# - Safer attention + faster logits
 # --------------------------------------------------
 
 import math
@@ -25,6 +26,7 @@ class SparseKNNGraphAttention(nn.Module):
         qkv = self.qkv(x).view(B, N, 3, D)
         q, k, v = qkv.unbind(dim=2)
 
+        # cosine similarity for kNN graph
         sim = torch.matmul(
             F.normalize(k, dim=-1),
             F.normalize(k, dim=-1).transpose(-1, -2)
@@ -48,6 +50,7 @@ class SparseKNNGraphAttention(nn.Module):
         out = (attn.unsqueeze(-1) * v_sel).sum(2)
         return x + self.out(out)
 
+
 # ==================================================
 # Static Graph Encoder
 # ==================================================
@@ -64,6 +67,7 @@ class GraphEncoder(nn.Module):
         for layer in self.layers:
             h = layer(h)
         return h
+
 
 # ==================================================
 # Token-level SSM Decoder (Mamba-style)
@@ -91,8 +95,9 @@ class SSMBlock(nn.Module):
 
         return x + y, state
 
+
 # ==================================================
-# Full TSP Model (NO VALUE HEAD)
+# Full TSP Model (policy-only, no value head)
 # ==================================================
 class TSPModel(nn.Module):
     def __init__(self, dim=256, layers=4):
@@ -107,7 +112,8 @@ class TSPModel(nn.Module):
         returns: log_probs, entropies, tour_length
         """
         B, N, _ = coords.shape
-        node_emb = self.encoder(coords)
+
+        node_emb = self.encoder(coords).contiguous()  # (B, N, D)
 
         visited = torch.zeros(B, N, dtype=torch.bool, device=coords.device)
         visited[:, 0] = True
@@ -125,11 +131,9 @@ class TSPModel(nn.Module):
             for i, layer in enumerate(self.decoder):
                 h, states[i] = layer(h, states[i])
 
-            logits = torch.einsum(
-                "bd,bnd->bn",
-                self.query(h).squeeze(1),
-                node_emb
-            )
+            # faster than einsum on GPU
+            q = self.query(h).squeeze(1)               # (B, D)
+            logits = torch.bmm(node_emb, q.unsqueeze(-1)).squeeze(-1)  # (B, N)
 
             logits = logits.masked_fill(visited, -1e9)
             dist = Categorical(logits=logits)
@@ -142,9 +146,9 @@ class TSPModel(nn.Module):
 
             prev = current
             tour_len += torch.norm(
-                coords[torch.arange(B), prev] -
-                coords[torch.arange(B), nxt],
-                dim=-1
+                coords[torch.arange(B), prev]
+                - coords[torch.arange(B), nxt],
+                dim=-1      
             )
 
             visited = visited.clone()
@@ -153,8 +157,7 @@ class TSPModel(nn.Module):
             token = node_emb[torch.arange(B), nxt].unsqueeze(1)
 
         tour_len += torch.norm(
-            coords[torch.arange(B), current] - coords[:, 0],
-            dim=-1
+            coords[torch.arange(B), current] - coords[:, 0], dim=-1
         )
 
         return log_probs, entropies, tour_len

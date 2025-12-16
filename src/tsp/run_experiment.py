@@ -5,6 +5,7 @@
 # - CLEAN LOGGING + ROUNDED VALUES
 #   * train CSV: step, loss, avg_tour, entropy
 #   * eval  CSV: eval_avg_tour, inference_ms
+# - Kaggle GPU–safe (no TPU auto-detect)
 # --------------------------------------------------
 
 import argparse
@@ -18,19 +19,11 @@ from utils.device import get_device, optimizer_step, sync
 
 
 # --------------------------------------------------
-# Auto device selection
+# Auto device selection (GPU-first, Kaggle-safe)
 # --------------------------------------------------
 def auto_device():
-    try:
-        import torch_xla.core.xla_model as xm
-        _ = xm.xla_device()
-        return "tpu"
-    except Exception:
-        pass
-
     if torch.cuda.is_available():
         return "cuda"
-
     return "cpu"
 
 
@@ -48,26 +41,31 @@ def entropy_schedule(step, total_steps, start, end):
 def train(model, opt, device, args, device_name, train_writer):
     model.train()
 
+    use_amp = device_name == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
     for step in range(args.steps):
         coords = torch.rand(args.batch, args.n_nodes, 2, device=device)
 
-        logp, ent, length = model.rollout(coords, greedy=False)
+        with torch.amp.autocast(enabled=use_amp):
+            logp, ent, length = model.rollout(coords, greedy=False)
 
-        with torch.no_grad():
-            _, _, greedy_len = model.rollout(coords, greedy=True)
+            with torch.no_grad():
+                _, _, greedy_len = model.rollout(coords, greedy=True)
 
-        entropy_coef = entropy_schedule(
-            step,
-            args.steps,
-            args.entropy_start,
-            args.entropy_end,
-        )
+            entropy_coef = entropy_schedule(
+                step,
+                args.steps,
+                args.entropy_start,
+                args.entropy_end,
+            )
 
-        loss = ((length - greedy_len) * logp).mean() - entropy_coef * ent.mean()
+            loss = ((length - greedy_len) * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad()
-        loss.backward()
-        optimizer_step(opt, device_name)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
 
         if step % args.log_every == 0:
             sync(device_name)
@@ -146,7 +144,10 @@ def run(args):
 
     os.makedirs("logs", exist_ok=True)
 
-    run_tag = f"tsp_N{args.n_nodes}_D{args.dim}_L{args.layers}_B{args.batch}_S{args.steps}"
+    run_tag = (
+        f"tsp_N{args.n_nodes}_D{args.dim}_L{args.layers}_"
+        f"B{args.batch}_S{args.steps}"
+    )
     train_log = f"logs/{run_tag}_train.csv"
     eval_log = f"logs/{run_tag}_eval.csv"
 
