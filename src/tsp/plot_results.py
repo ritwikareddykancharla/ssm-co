@@ -9,8 +9,8 @@ sns.set_theme(style="whitegrid", font_scale=1.25)
 LOGS = {
     "TSP10": "logs/tsp10_dim128.log",
     "TSP20": "logs/tsp20_dim128.log",
-    # "TSP50": "logs/tsp50_dim256.log",
-    # "TSP100": "logs/tsp100_dim256.log",
+    "TSP50": "logs/tsp50_dim256.log",
+    "TSP100": "logs/tsp100_dim256.log",
 }
 
 pattern = re.compile(

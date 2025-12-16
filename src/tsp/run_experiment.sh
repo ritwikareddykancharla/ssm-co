@@ -1,47 +1,64 @@
 #!/bin/bash
-set -e
+# ==================================================
+# Sequential TSP Experiments (TPU / GPU / CPU)
+# Same model, different N
+# ==================================================
 
-mkdir -p logs
+DIM=256
+LAYERS=4
+STEPS=10000
+BATCH=512        # TPU-friendly (use 512 if OOM)
+LR=1e-4
 
-echo "Running TSP experiments on TPU..."
+EVAL_K=16
+LOG_EVERY=10
 
-# -------- SMALL PROBLEMS --------
-python tsp_toy.py \
+echo "======================================"
+echo "Running Sequential TSP Experiments"
+echo "dim=$DIM layers=$LAYERS steps=$STEPS batch=$BATCH"
+echo "======================================"
+
+# -------- TSP 10 --------
+python run_experiment.py \
   --n_nodes 10 \
-  --dim 128 \
-  --layers 2 \
-  --batch 16 \
-  --steps 500 \
-  --log_every 5 \
-  > logs/tsp10_dim128.log
+  --dim $DIM \
+  --layers $LAYERS \
+  --batch $BATCH \
+  --steps $STEPS \
+  --eval_k $EVAL_K \
+  --log_every $LOG_EVERY
 
-python tsp_toy.py \
+# -------- TSP 20 --------
+python run_experiment.py \
   --n_nodes 20 \
-  --dim 128 \
-  --layers 2 \
-  --batch 16 \
-  --steps 500 \
-  --log_every 5 \
-  > logs/tsp20_dim128.log
+  --dim $DIM \
+  --layers $LAYERS \
+  --batch $BATCH \
+  --steps $STEPS \
+  --eval_k $EVAL_K \
+  --log_every $LOG_EVERY
 
-# -------- MEDIUM PROBLEM --------
-python tsp_toy.py \
+# -------- TSP 50 --------
+python run_experiment.py \
   --n_nodes 50 \
-  --dim 256 \
-  --layers 4 \
-  --batch 16 \
-  --steps 500 \
-  --log_every 10 \
-  > logs/tsp50_dim256.log
+  --dim $DIM \
+  --layers $LAYERS \
+  --batch $BATCH \
+  --steps $STEPS \
+  --eval_k $EVAL_K \
+  --log_every $LOG_EVERY
 
-# -------- LARGE PROBLEM --------
-python tsp_toy.py \
+# -------- TSP 100 --------
+python run_experiment.py \
   --n_nodes 100 \
-  --dim 256 \
-  --layers 4 \
-  --batch 16 \
-  --steps 500 \
-  --log_every 10 \
-  > logs/tsp100_dim256.log
+  --dim $DIM \
+  --layers $LAYERS \
+  --batch $BATCH \
+  --steps $STEPS \
+  --eval_k $EVAL_K \
+  --log_every $LOG_EVERY
 
-echo "All experiments completed."
+echo "======================================"
+echo "All experiments finished 💅"
+echo "Logs saved in logs/"
+echo "======================================"
