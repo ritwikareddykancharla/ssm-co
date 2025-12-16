@@ -1,11 +1,10 @@
 # --------------------------------------------------
-# Curriculum TSP Trainer (PAPER-READY)
+# Curriculum TSP Trainer (DDP, FAST)
 # - SINGLE fixed-size model
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - EMA baseline (strong advantage signal)
+# - EMA baseline
 # - Entropy regularization (training only)
-# - Sampling-only evaluation
-# - CLEAN CSV logs
+# - Sampling-only evaluation (rank 0)
 # --------------------------------------------------
 
 import argparse
@@ -13,13 +12,14 @@ import csv
 import os
 import time
 import torch
+import torch.distributed as dist
 
 from model import TSPModel
 from utils.device import sync
 
 
 # --------------------------------------------------
-# Entropy schedule (per stage)
+# Entropy schedule
 # --------------------------------------------------
 
 def entropy_schedule(step, total_steps, start, end):
@@ -43,16 +43,19 @@ def train_stage(
     ema_beta,
     log_every,
     log_path,
+    is_main,
 ):
     model.train()
-    net = model
+    net = model.module if hasattr(model, "module") else model
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
     ema_baseline = None
 
-    with open(log_path, "w", newline="") as f:
+    writer = None
+    if is_main:
+        f = open(log_path, "w", newline="")
         writer = csv.writer(f)
         writer.writerow([
             "step",
@@ -63,35 +66,36 @@ def train_stage(
             "ema_baseline",
         ])
 
-        for step in range(steps):
-            coords = torch.rand(batch, n_nodes, 2, device=device)
+    for step in range(steps):
+        coords = torch.rand(batch, n_nodes, 2, device=device)
 
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                logp, ent, length = net.rollout(coords, greedy=False)
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            logp, ent, length = net.rollout(coords, greedy=False)
 
-                # EMA baseline
-                with torch.no_grad():
-                    mean_len = length.mean().item()
-                    ema_baseline = (
-                        mean_len if ema_baseline is None
-                        else ema_beta * ema_baseline + (1 - ema_beta) * mean_len
-                    )
-
-                entropy_coef = entropy_schedule(
-                    step, steps, entropy_start, entropy_end
+            # EMA baseline (local, rank-0 only is enough)
+            with torch.no_grad():
+                mean_len = length.mean().item()
+                ema_baseline = (
+                    mean_len if ema_baseline is None
+                    else ema_beta * ema_baseline + (1 - ema_beta) * mean_len
                 )
 
-                advantage = length - ema_baseline
-                loss = (advantage * logp).mean() - entropy_coef * ent.mean()
+            entropy_coef = entropy_schedule(
+                step, steps, entropy_start, entropy_end
+            )
 
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            advantage = length - ema_baseline
+            loss = (advantage * logp).mean() - entropy_coef * ent.mean()
 
-            if step % log_every == 0:
-                sync("cuda")
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
 
+        if step % log_every == 0:
+            sync("cuda")
+
+            if is_main:
                 writer.writerow([
                     step,
                     n_nodes,
@@ -110,15 +114,18 @@ def train_stage(
                     f"entropy {entropy_coef:.3f}"
                 )
 
+    if is_main:
+        f.close()
+
 
 # --------------------------------------------------
-# Evaluation (sampling-only)
+# Evaluation (rank 0 only)
 # --------------------------------------------------
 
 @torch.no_grad()
 def evaluate(model, device, n_nodes, batch, eval_k, eval_batches):
     model.eval()
-    net = model
+    net = model.module if hasattr(model, "module") else model
 
     tours, times = [], []
 
@@ -158,20 +165,40 @@ def main():
     parser.add_argument("--entropy_end", type=float, default=0.02)
     parser.add_argument("--ema_beta", type=float, default=0.99)
 
-    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--log_every", type=int, default=50)
 
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n Device: {device}")
+    # ---------------- DDP SETUP ----------------
+    is_ddp = "RANK" in os.environ
 
-    os.makedirs("logs", exist_ok=True)
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        is_main = dist.get_rank() == 0
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        is_main = True
 
-    # FIXED BIG MODEL
+    if is_main:
+        print(f"\n🚀 Device: {device}")
+        os.makedirs("logs", exist_ok=True)
+
+    # ---------------- MODEL ----------------
     model = TSPModel(dim=args.dim, layers=args.layers).to(device)
+
+    if is_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
+
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # CURRICULUM (ONLY N CHANGES)
+    # ---------------- CURRICULUM ----------------
     curriculum = [
         dict(N=10,  steps=3000),
         dict(N=20,  steps=10000),
@@ -183,7 +210,8 @@ def main():
         N = stage["N"]
         steps = stage["steps"]
 
-        print(f"\n Training TSP{N} for {steps} steps")
+        if is_main:
+            print(f"\n🔥 Training TSP{N} for {steps} steps")
 
         train_log = f"logs/tsp_curriculum_N{N}_train.csv"
 
@@ -199,22 +227,28 @@ def main():
             ema_beta=args.ema_beta,
             log_every=args.log_every,
             log_path=train_log,
+            is_main=is_main,
         )
 
-        avg_tour, avg_time = evaluate(
-            model,
-            device,
-            n_nodes=N,
-            batch=args.batch,
-            eval_k=32,
-            eval_batches=20,
-        )
+        if is_main:
+            avg_tour, avg_time = evaluate(
+                model,
+                device,
+                n_nodes=N,
+                batch=args.batch,
+                eval_k=32,
+                eval_batches=20,
+            )
 
-        print(
-            f"📊 Eval TSP{N} | "
-            f"tour={avg_tour:.3f} | "
-            f"time={avg_time:.1f} ms"
-        )
+            print(
+                f"📊 Eval TSP{N} | "
+                f"tour={avg_tour:.3f} | "
+                f"time={avg_time:.1f} ms"
+            )
+
+    if is_ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
