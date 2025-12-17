@@ -67,7 +67,7 @@ def train_stage(
     for step in range(steps):
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
-        with torch.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
             # -------- SAMPLE POLICY --------
             logp, ent, sampled_len = net.rollout(coords, greedy=False)
 
