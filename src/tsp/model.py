@@ -131,8 +131,9 @@ class TSPModel(nn.Module):
 
             q = self.query(h).squeeze(1)
             logits = torch.bmm(node_emb, q.unsqueeze(-1)).squeeze(-1)
-            logits = logits.masked_fill(visited, -1e9)
-
+            mask_val = torch.finfo(logits.dtype).min
+            logits = logits.masked_fill(visited, mask_val)
+            
             dist = Categorical(logits=logits)
             nxt = torch.argmax(logits, dim=-1) if greedy else dist.sample()
 
