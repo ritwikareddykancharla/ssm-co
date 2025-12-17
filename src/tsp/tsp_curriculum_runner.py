@@ -2,13 +2,13 @@
 # Curriculum TSP Trainer (DDP, STABLE, AMP-SAFE)
 # TWO-PHASE TRAINING WITH GAP-WEIGHTED REINFORCE
 # --------------------------------------------------
-# Phase 1: Pure tour-cost REINFORCE (learn geometry)
-# Phase 2: Gap-weighted REINFORCE + late self-distillation
+# Phase 1: Pure tour-cost REINFORCE (GREEDY baseline, FAST)
+# Phase 2: Gap-weighted REINFORCE + late self-distillation (POMO-lite)
 # --------------------------------------------------
 # - SINGLE fixed-size model (same for all N)
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - POMO-lite sampling (same logic for ALL N)
-# - Distillation starts after % of Phase 2
+# - NO POMO in Phase 1 (speed + stability)
+# - POMO-lite + distillation only in Phase 2
 # - Greedy eval only (rank 0)
 # --------------------------------------------------
 
@@ -32,7 +32,7 @@ def entropy_schedule(step, total_steps, start, end):
 
 
 # --------------------------------------------------
-# Train ONE curriculum stage
+# Train ONE curriculum stage (2 phases)
 # --------------------------------------------------
 def train_stage(
     model,
@@ -47,7 +47,8 @@ def train_stage(
     log_path,
     is_main,
     pomo_k=8,
-    distill_start_frac=0.6,  # distillation kicks in after 60%
+    phase1_frac=0.6,        # first 60% = pure REINFORCE
+    distill_start_frac=0.8, # distill only in last 20%
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
@@ -60,56 +61,65 @@ def train_stage(
         writer = csv.writer(f)
         writer.writerow([
             "step",
+            "phase",
             "n_nodes",
             "loss",
             "avg_sampled",
-            "avg_pomo_best",
+            "baseline",
             "entropy",
         ])
 
     for step in range(steps):
         coords = torch.rand(batch, n_nodes, 2, device=device)
+        phase1 = step < int(phase1_frac * steps)
         distill_on = step >= int(distill_start_frac * steps)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            # ------------------------------
-            # Sample current policy
-            # ------------------------------
+            # --------------------------------------------------
+            # Sample policy
+            # --------------------------------------------------
             logp, ent, sampled_len = net.rollout(coords, greedy=False)
 
-            # ------------------------------
-            # POMO-lite baseline (NO GRAD)
-            # ------------------------------
-            with torch.no_grad():
-                best_len = None
-                best_logp = None
-                for _ in range(pomo_k):
-                    lp, _, l = net.rollout(coords, greedy=False)
-                    if best_len is None:
-                        best_len, best_logp = l, lp
-                    else:
-                        mask = l < best_len
-                        best_len = torch.where(mask, l, best_len)
-                        best_logp = torch.where(mask, lp, best_logp)
+            # ==================================================
+            # PHASE 1: GREEDY BASELINE REINFORCE (FAST)
+            # ==================================================
+            if phase1:
+                with torch.no_grad():
+                    _, _, greedy_len = net.rollout(coords, greedy=True)
 
-            # ------------------------------
-            # GAP-WEIGHTED REINFORCE (MAIN)
-            # ------------------------------
-            gap = sampled_len - best_len
-            reinforce_loss = (gap.detach() * logp).mean()
+                advantage = sampled_len - greedy_len
+                loss = (advantage.detach() * logp).mean()
+                baseline_val = greedy_len.mean()
+                phase_name = "P1"
 
-            # ------------------------------
-            # OPTIONAL SELF-DISTILLATION (LATE)
-            # ------------------------------
-            if distill_on:
-                distill_loss = -best_logp.mean()
-                loss = reinforce_loss + distill_loss
+            # ==================================================
+            # PHASE 2: GAP-WEIGHTED + OPTIONAL DISTILLATION
+            # ==================================================
             else:
-                loss = reinforce_loss
+                with torch.no_grad():
+                    best_len = None
+                    best_logp = None
+                    for _ in range(pomo_k):
+                        lp, _, l = net.rollout(coords, greedy=False)
+                        if best_len is None:
+                            best_len, best_logp = l, lp
+                        else:
+                            mask = l < best_len
+                            best_len = torch.where(mask, l, best_len)
+                            best_logp = torch.where(mask, lp, best_logp)
 
-            # ------------------------------
-            # Entropy (anneal hard)
-            # ------------------------------
+                gap = sampled_len - best_len
+                loss = (gap.detach() * logp).mean()
+                baseline_val = best_len.mean()
+                phase_name = "P2"
+
+                if distill_on:
+                    loss = loss - best_logp.mean()
+                    phase_name = "P2+DISTILL"
+
+            # --------------------------------------------------
+            # Entropy (anneal to zero)
+            # --------------------------------------------------
             entropy_coef = entropy_schedule(step, steps, entropy_start, entropy_end)
             loss = loss - entropy_coef * ent.mean()
 
@@ -123,18 +133,19 @@ def train_stage(
             if is_main:
                 writer.writerow([
                     step,
+                    phase_name,
                     n_nodes,
                     round(loss.item(), 6),
                     round(sampled_len.mean().item(), 6),
-                    round(best_len.mean().item(), 6),
+                    round(baseline_val.item(), 6),
                     round(entropy_coef, 6),
                 ])
                 f.flush()
 
                 print(
-                    f"[TRAIN][N={n_nodes}] step {step:05d} | "
+                    f"[{phase_name}][N={n_nodes}] step {step:05d} | "
                     f"sampled {sampled_len.mean():.3f} | "
-                    f"pomo {best_len.mean():.3f} | "
+                    f"baseline {baseline_val:.3f} | "
                     f"entropy {entropy_coef:.4f}"
                 )
 
