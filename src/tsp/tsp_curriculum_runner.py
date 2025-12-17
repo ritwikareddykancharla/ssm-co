@@ -1,12 +1,14 @@
 # --------------------------------------------------
-# TWO-PHASE CURRICULUM TSP TRAINER (DDP, AMP-SAFE)
+# Curriculum TSP Trainer (DDP, STABLE, AMP-SAFE)
+# TWO-PHASE TRAINING WITH GAP-WEIGHTED REINFORCE
 # --------------------------------------------------
-# PHASE 1: COST-ONLY REINFORCE (learn geometry)
-# PHASE 2: SELF-DISTILLATION FROM POMO-BEST (learn search)
+# Phase 1: Pure tour-cost REINFORCE (learn geometry)
+# Phase 2: Gap-weighted REINFORCE + late self-distillation
 # --------------------------------------------------
-# - Single fixed-size model (same for all N)
+# - SINGLE fixed-size model (same for all N)
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - No hardcoded alphas, clean separation of phases
+# - POMO-lite sampling (same logic for ALL N)
+# - Distillation starts after % of Phase 2
 # - Greedy eval only (rank 0)
 # --------------------------------------------------
 
@@ -22,7 +24,7 @@ from utils.device import sync
 
 
 # --------------------------------------------------
-# Entropy schedule
+# Entropy schedule (linear)
 # --------------------------------------------------
 def entropy_schedule(step, total_steps, start, end):
     frac = min(step / total_steps, 1.0)
@@ -30,71 +32,9 @@ def entropy_schedule(step, total_steps, start, end):
 
 
 # --------------------------------------------------
-# PHASE 1 — COST-ONLY REINFORCE
+# Train ONE curriculum stage
 # --------------------------------------------------
-def train_phase1(
-    model,
-    opt,
-    device,
-    n_nodes,
-    steps,
-    batch,
-    entropy_start,
-    entropy_end,
-    log_every,
-    log_path,
-    is_main,
-):
-    model.train()
-    net = model.module if hasattr(model, "module") else model
-
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
-
-    if is_main:
-        f = open(log_path, "w", newline="")
-        writer = csv.writer(f)
-        writer.writerow(["step", "n_nodes", "loss", "avg_tour", "entropy"])
-
-    for step in range(steps):
-        coords = torch.rand(batch, n_nodes, 2, device=device)
-
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            logp, ent, length = net.rollout(coords, greedy=False)
-            baseline = length.detach().mean()
-            advantage = (length - baseline).detach()
-
-            entropy_coef = entropy_schedule(step, steps, entropy_start, entropy_end)
-            loss = (advantage * logp).mean() - entropy_coef * ent.mean()
-
-        opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
-
-        if step % log_every == 0:
-            sync("cuda")
-            if is_main:
-                writer.writerow([
-                    step,
-                    n_nodes,
-                    round(loss.item(), 6),
-                    round(length.mean().item(), 6),
-                    round(entropy_coef, 6),
-                ])
-                f.flush()
-                print(
-                    f"[PHASE1][N={n_nodes}] step {step:05d} | tour {length.mean():.3f} | entropy {entropy_coef:.4f}"
-                )
-
-    if is_main:
-        f.close()
-
-
-# --------------------------------------------------
-# PHASE 2 — SELF-DISTILLATION FROM POMO-BEST
-# --------------------------------------------------
-def train_phase2(
+def train_stage(
     model,
     opt,
     device,
@@ -107,6 +47,7 @@ def train_phase2(
     log_path,
     is_main,
     pomo_k=8,
+    distill_start_frac=0.6,  # distillation kicks in after 60%
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
@@ -128,30 +69,49 @@ def train_phase2(
 
     for step in range(steps):
         coords = torch.rand(batch, n_nodes, 2, device=device)
+        distill_on = step >= int(distill_start_frac * steps)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            # ----- POMO sampling (teacher signal) -----
+            # ------------------------------
+            # Sample current policy
+            # ------------------------------
+            logp, ent, sampled_len = net.rollout(coords, greedy=False)
+
+            # ------------------------------
+            # POMO-lite baseline (NO GRAD)
+            # ------------------------------
             with torch.no_grad():
-                all_logp, all_len = [], []
+                best_len = None
+                best_logp = None
                 for _ in range(pomo_k):
-                    lp, _, ln = net.rollout(coords, greedy=False)
-                    all_logp.append(lp)
-                    all_len.append(ln)
+                    lp, _, l = net.rollout(coords, greedy=False)
+                    if best_len is None:
+                        best_len, best_logp = l, lp
+                    else:
+                        mask = l < best_len
+                        best_len = torch.where(mask, l, best_len)
+                        best_logp = torch.where(mask, lp, best_logp)
 
-                all_logp = torch.stack(all_logp)  # [K,B]
-                all_len = torch.stack(all_len)    # [K,B]
-                best_idx = all_len.argmin(dim=0)
-                pomo_best = all_len.min(dim=0).values
+            # ------------------------------
+            # GAP-WEIGHTED REINFORCE (MAIN)
+            # ------------------------------
+            gap = sampled_len - best_len
+            reinforce_loss = (gap.detach() * logp).mean()
 
-            B = batch
-            best_logp = all_logp[best_idx, torch.arange(B, device=device)]
-            distill_loss = -best_logp.mean()
+            # ------------------------------
+            # OPTIONAL SELF-DISTILLATION (LATE)
+            # ------------------------------
+            if distill_on:
+                distill_loss = -best_logp.mean()
+                loss = reinforce_loss + distill_loss
+            else:
+                loss = reinforce_loss
 
-            # ----- entropy -----
-            _, ent, sampled_len = net.rollout(coords, greedy=False)
+            # ------------------------------
+            # Entropy (anneal hard)
+            # ------------------------------
             entropy_coef = entropy_schedule(step, steps, entropy_start, entropy_end)
-
-            loss = distill_loss - entropy_coef * ent.mean()
+            loss = loss - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -166,12 +126,16 @@ def train_phase2(
                     n_nodes,
                     round(loss.item(), 6),
                     round(sampled_len.mean().item(), 6),
-                    round(pomo_best.mean().item(), 6),
+                    round(best_len.mean().item(), 6),
                     round(entropy_coef, 6),
                 ])
                 f.flush()
+
                 print(
-                    f"[PHASE2][N={n_nodes}] step {step:05d} | sampled {sampled_len.mean():.3f} | pomo {pomo_best.mean():.3f}"
+                    f"[TRAIN][N={n_nodes}] step {step:05d} | "
+                    f"sampled {sampled_len.mean():.3f} | "
+                    f"pomo {best_len.mean():.3f} | "
+                    f"entropy {entropy_coef:.4f}"
                 )
 
     if is_main:
@@ -179,19 +143,20 @@ def train_phase2(
 
 
 # --------------------------------------------------
-# Evaluation (greedy)
+# Evaluation (GREEDY)
 # --------------------------------------------------
 @torch.no_grad()
 def evaluate(model, device, n_nodes, batch, eval_batches):
     model.eval()
     net = model.module if hasattr(model, "module") else model
 
-    vals = []
+    tours = []
     for _ in range(eval_batches):
         coords = torch.rand(batch, n_nodes, 2, device=device)
         _, _, length = net.rollout(coords, greedy=True)
-        vals.append(length.mean().item())
-    return sum(vals) / len(vals)
+        tours.append(length.mean().item())
+
+    return sum(tours) / len(tours)
 
 
 # --------------------------------------------------
@@ -209,7 +174,7 @@ def main():
 
     is_ddp = "RANK" in os.environ
     if is_ddp:
-        dist.init_process_group("nccl")
+        dist.init_process_group(backend="nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
@@ -224,33 +189,50 @@ def main():
 
     model = TSPModel(dim=args.dim, layers=args.layers).to(device)
     if is_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    curriculum = [10, 20, 50, 100]
+    curriculum = [
+        dict(N=10,  steps=1500, ent=(0.05, 0.0)),
+        dict(N=20,  steps=3000, ent=(0.05, 0.0)),
+        dict(N=50,  steps=5000, ent=(0.06, 0.0)),
+        dict(N=100, steps=8000, ent=(0.06, 0.0)),
+    ]
 
-    for N in curriculum:
+    for stage in curriculum:
+        N = stage["N"]
+        steps = stage["steps"]
+        ent_start, ent_end = stage["ent"]
+
         if is_main:
-            print(f"\n=== TSP{N}: PHASE 1 ===")
-        train_phase1(
-            model, opt, device, N, 1000, args.batch, 0.05, 0.02,
-            args.log_every, f"logs/tsp{N}_phase1.csv", is_main
+            print(f"\nTraining TSP{N}")
+
+        train_stage(
+            model=model,
+            opt=opt,
+            device=device,
+            n_nodes=N,
+            steps=steps,
+            batch=args.batch,
+            entropy_start=ent_start,
+            entropy_end=ent_end,
+            log_every=args.log_every,
+            log_path=f"logs/tsp_gap_weighted_N{N}.csv",
+            is_main=is_main,
+            pomo_k=args.pomo_k,
         )
 
         if is_main:
-            print(f"Eval after phase1: {evaluate(model, device, N, args.batch, 20):.3f}")
-            print(f"\n=== TSP{N}: PHASE 2 ===")
-
-        train_phase2(
-            model, opt, device, N, 2000, args.batch, 0.03, 0.01,
-            args.log_every, f"logs/tsp{N}_phase2.csv", is_main, args.pomo_k
-        )
-
-        if is_main:
-            print(f"Eval after phase2: {evaluate(model, device, N, args.batch, 20):.3f}")
+            avg = evaluate(model, device, N, args.batch, eval_batches=20)
+            print(f"Eval TSP{N}: {avg:.3f}")
 
     if is_ddp:
+        dist.barrier()
         dist.destroy_process_group()
 
 
