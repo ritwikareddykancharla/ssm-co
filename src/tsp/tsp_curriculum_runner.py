@@ -194,10 +194,10 @@ def main():
 
     # ---------------- CURRICULUM ----------------
     curriculum = [
-        dict(N=10,  steps=2000,  ent=(0.03, 0.005)),  # converge & collapse
-        dict(N=20,  steps=5000,  ent=(0.03, 0.01)),   # gentle expansion
-        dict(N=50,  steps=10000, ent=(0.04, 0.015)),  # controlled exploration
-        dict(N=100, steps=20000, ent=(0.05, 0.02)),   # scaling regime
+        dict(N=10,  steps=1000,  ent=(0.03, 0.005)),  # converge & collapse
+        dict(N=20,  steps=3000,  ent=(0.03, 0.01)),   # gentle expansion
+        dict(N=50,  steps=5000, ent=(0.04, 0.015)),  # controlled exploration
+        dict(N=100, steps=10000, ent=(0.05, 0.02)),   # scaling regime
     ]
 
     for stage in curriculum:
