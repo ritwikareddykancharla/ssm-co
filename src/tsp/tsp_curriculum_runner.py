@@ -3,7 +3,7 @@
 # - SINGLE fixed-size model
 # - Curriculum over N (10 → 20 → 50 → 100)
 # - Greedy baseline (NO EMA)
-# - CORRECT REINFORCE loss
+# - CORRECT REINFORCE loss (ADVANTAGE DETACHED)
 # - Entropy regularization (training only)
 # - Sampling-only evaluation (rank 0)
 # --------------------------------------------------
@@ -72,9 +72,9 @@ def train_stage(
             if use_greedy_baseline:
                 with torch.no_grad():
                     _, _, greedy_len = net.rollout(coords, greedy=True)
-                advantage = length - greedy_len      # ✅ DO NOT DETACH length
+                advantage = (length - greedy_len).detach()
             else:
-                advantage = length
+                advantage = length.detach()
 
             # -------- ENTROPY --------
             entropy_coef = entropy_schedule(
@@ -82,7 +82,6 @@ def train_stage(
             )
 
             # -------- CORRECT REINFORCE LOSS --------
-            # Minimize expected tour length
             loss = (advantage * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)

@@ -145,8 +145,10 @@ class TSPModel(nn.Module):
             logits = torch.bmm(node_emb, q.unsqueeze(-1)).squeeze(-1)
 
             # AMP-safe masking
-            mask_val = torch.finfo(logits.dtype).min
-            logits = logits.masked_fill(visited, mask_val)
+            # mask_val = torch.finfo(logits.dtype).min
+            logits = logits.float()
+            logits = logits.masked_fill(visited, -1e9)
+            # logits = logits.masked_fill(visited, mask_val)
 
             dist = Categorical(logits=logits)
             nxt = torch.argmax(logits, dim=-1) if greedy else dist.sample()
