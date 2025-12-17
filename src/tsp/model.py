@@ -1,7 +1,8 @@
 # --------------------------------------------------
 # Minimal TSP model + rollout (device-agnostic)
 # - GPU-optimized (no TPU/XLA assumptions)
-# - Safer attention + faster logits
+# - AMP-safe masking (FP16 compatible)
+# - Autograd-safe rollout (no in-place mask mutation)
 # --------------------------------------------------
 
 import math
@@ -32,7 +33,7 @@ class SparseKNNGraphAttention(nn.Module):
             F.normalize(k, dim=-1).transpose(-1, -2)
         )
 
-        sim = sim - 1e9 * torch.eye(N, device=x.device)
+        sim = sim - torch.eye(N, device=x.device) * 1e9
 
         k_val = min(self.k, N - 1)
         _, idx = sim.topk(k_val, dim=-1)  # [B, N, k]
@@ -97,7 +98,7 @@ class SSMBlock(nn.Module):
 
 
 # ==================================================
-# Full TSP Model (policy-only, no value head)
+# Full TSP Model (policy-only)
 # ==================================================
 class TSPModel(nn.Module):
     def __init__(self, dim=256, layers=4):
@@ -107,22 +108,33 @@ class TSPModel(nn.Module):
         self.query = nn.Linear(dim, dim)
 
     def rollout(self, coords, greedy=False):
+        """
+        Args:
+            coords : Tensor[B, N, 2]
+            greedy : bool
+
+        Returns:
+            log_probs : Tensor[B]
+            entropies : Tensor[B]
+            tour_len  : Tensor[B]
+        """
         B, N, _ = coords.shape
+        device = coords.device
 
         node_emb = self.encoder(coords)
 
-        start = torch.randint(0, N, (B,), device=coords.device)
+        start = torch.randint(0, N, (B,), device=device)
 
-        visited = torch.zeros(B, N, dtype=torch.bool, device=coords.device)
+        visited = torch.zeros(B, N, dtype=torch.bool, device=device)
         visited[torch.arange(B), start] = True
 
         current = start
         token = node_emb[torch.arange(B), start].unsqueeze(1)
         states = [None] * len(self.decoder)
 
-        log_probs = torch.zeros(B, device=coords.device)
-        entropies = torch.zeros(B, device=coords.device)
-        tour_len = torch.zeros(B, device=coords.device)
+        log_probs = torch.zeros(B, device=device)
+        entropies = torch.zeros(B, device=device)
+        tour_len = torch.zeros(B, device=device)
 
         for _ in range(N - 1):
             h = token
@@ -131,9 +143,11 @@ class TSPModel(nn.Module):
 
             q = self.query(h).squeeze(1)
             logits = torch.bmm(node_emb, q.unsqueeze(-1)).squeeze(-1)
+
+            # AMP-safe masking
             mask_val = torch.finfo(logits.dtype).min
             logits = logits.masked_fill(visited, mask_val)
-            
+
             dist = Categorical(logits=logits)
             nxt = torch.argmax(logits, dim=-1) if greedy else dist.sample()
 
@@ -147,7 +161,10 @@ class TSPModel(nn.Module):
                 dim=-1
             )
 
+            # autograd-safe mask update
+            visited = visited.clone()
             visited[torch.arange(B), nxt] = True
+
             current = nxt
             token = node_emb[torch.arange(B), nxt].unsqueeze(1)
 
