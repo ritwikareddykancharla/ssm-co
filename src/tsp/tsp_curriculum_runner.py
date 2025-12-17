@@ -194,10 +194,10 @@ def main():
 
     # ---------------- CURRICULUM ----------------
     curriculum = [
-        dict(N=10,  steps=2000,  ent=(0.05, 0.02)),
-        dict(N=20,  steps=5000, ent=(0.08, 0.03)),
-        dict(N=50,  steps=10000, ent=(0.10, 0.04)),
-        dict(N=100, steps=20000, ent=(0.12, 0.05)),
+        dict(N=10,  steps=2000,  ent=(0.03, 0.005)),   # sanity only
+        dict(N=20,  steps=5000,  ent=(0.08, 0.03)),    # structure learning
+        dict(N=50,  steps=10000, ent=(0.10, 0.04)),    # real neural CO
+        dict(N=100, steps=20000, ent=(0.12, 0.05)),    # scaling regime
     ]
 
     for stage in curriculum:
