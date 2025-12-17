@@ -1,9 +1,10 @@
 # --------------------------------------------------
 # Curriculum TSP Trainer (DDP, STABLE, AMP-SAFE)
-# - SINGLE fixed-size model
+# - SINGLE fixed-size model (same for all N)
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - Greedy rollout baseline (no EMA, no grad)
+# - POMO-lite baseline (same logic for ALL N, no hardcoding)
 # - CORRECT REINFORCE (ADVANTAGE * LOGP)
+# - Advantage normalization
 # - Entropy regularization + floor (prevents collapse)
 # - Greedy eval only (rank 0)
 # --------------------------------------------------
@@ -28,7 +29,7 @@ def entropy_schedule(step, total_steps, start, end):
 
 
 # --------------------------------------------------
-# Train ONE curriculum stage
+# Train ONE curriculum stage (POMO-lite)
 # --------------------------------------------------
 def train_stage(
     model,
@@ -42,14 +43,14 @@ def train_stage(
     log_every,
     log_path,
     is_main,
+    pomo_k=4,
     entropy_floor=0.01,
-    use_greedy_baseline=True,
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
 
     use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
 
     if is_main:
         f = open(log_path, "w", newline="")
@@ -59,24 +60,25 @@ def train_stage(
             "n_nodes",
             "loss",
             "avg_sampled_tour",
-            "avg_greedy_tour",
+            "avg_pomo_best",
             "entropy_coef",
         ])
 
     for step in range(steps):
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(enabled=use_amp):
             # -------- SAMPLE POLICY --------
             logp, ent, sampled_len = net.rollout(coords, greedy=False)
 
-            # -------- GREEDY BASELINE (NO GRAD) --------
-            if use_greedy_baseline:
-                with torch.no_grad():
-                    _, _, greedy_len = net.rollout(coords, greedy=True)
-                advantage = (sampled_len - greedy_len)
-            else:
-                advantage = sampled_len
+            # -------- POMO-LITE BASELINE (NO GRAD, SAME FOR ALL N) --------
+            with torch.no_grad():
+                best_len = None
+                for _ in range(pomo_k):
+                    _, _, l = net.rollout(coords, greedy=False)
+                    best_len = l if best_len is None else torch.minimum(best_len, l)
+
+            advantage = sampled_len - best_len
 
             # -------- ADVANTAGE NORMALIZATION --------
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
@@ -103,7 +105,7 @@ def train_stage(
                     n_nodes,
                     round(loss.item(), 6),
                     round(sampled_len.mean().item(), 6),
-                    round(greedy_len.mean().item(), 6),
+                    round(best_len.mean().item(), 6),
                     round(entropy_coef, 6),
                 ])
                 f.flush()
@@ -112,7 +114,7 @@ def train_stage(
                     f"[TRAIN][N={n_nodes}] "
                     f"step {step:05d} | "
                     f"sampled {sampled_len.mean():.3f} | "
-                    f"greedy {greedy_len.mean():.3f} | "
+                    f"pomo-best {best_len.mean():.3f} | "
                     f"entropy {entropy_coef:.4f}"
                 )
 
@@ -155,6 +157,7 @@ def main():
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--pomo_k", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -217,8 +220,8 @@ def main():
             log_every=args.log_every,
             log_path=train_log,
             is_main=is_main,
+            pomo_k=args.pomo_k,
             entropy_floor=0.01,
-            use_greedy_baseline=True,
         )
 
         if is_main:
