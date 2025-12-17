@@ -1,11 +1,11 @@
 # --------------------------------------------------
-# Curriculum TSP Trainer (DDP, FAST, CORRECT)
+# Curriculum TSP Trainer (DDP, STABLE, AMP-SAFE)
 # - SINGLE fixed-size model
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - Greedy baseline (NO EMA)
-# - CORRECT REINFORCE loss (ADVANTAGE DETACHED)
-# - Entropy regularization (training only)
-# - Sampling-only evaluation (rank 0)
+# - Greedy rollout baseline (no EMA, no grad)
+# - CORRECT REINFORCE (ADVANTAGE * LOGP)
+# - Entropy regularization + floor (prevents collapse)
+# - Greedy eval only (rank 0)
 # --------------------------------------------------
 
 import argparse
@@ -20,10 +20,10 @@ from utils.device import sync
 
 
 # --------------------------------------------------
-# Entropy schedule
+# Entropy schedule (linear)
 # --------------------------------------------------
 def entropy_schedule(step, total_steps, start, end):
-    frac = step / total_steps
+    frac = min(step / total_steps, 1.0)
     return start * (1 - frac) + end * frac
 
 
@@ -42,13 +42,14 @@ def train_stage(
     log_every,
     log_path,
     is_main,
+    entropy_floor=0.01,
     use_greedy_baseline=True,
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
 
     use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     if is_main:
         f = open(log_path, "w", newline="")
@@ -57,31 +58,35 @@ def train_stage(
             "step",
             "n_nodes",
             "loss",
-            "avg_tour",
+            "avg_sampled_tour",
+            "avg_greedy_tour",
             "entropy_coef",
         ])
 
     for step in range(steps):
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+        with torch.cuda.amp.autocast(enabled=use_amp):
             # -------- SAMPLE POLICY --------
-            logp, ent, length = net.rollout(coords, greedy=False)
+            logp, ent, sampled_len = net.rollout(coords, greedy=False)
 
             # -------- GREEDY BASELINE (NO GRAD) --------
             if use_greedy_baseline:
                 with torch.no_grad():
                     _, _, greedy_len = net.rollout(coords, greedy=True)
-                advantage = (length - greedy_len).detach()
+                advantage = (sampled_len - greedy_len)
             else:
-                advantage = length.detach()
+                advantage = sampled_len
+
+            # -------- ADVANTAGE NORMALIZATION --------
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
+            advantage = advantage.detach()
 
             # -------- ENTROPY --------
-            entropy_coef = entropy_schedule(
-                step, steps, entropy_start, entropy_end
-            )
+            entropy_coef = entropy_schedule(step, steps, entropy_start, entropy_end)
+            entropy_coef = max(entropy_coef, entropy_floor)
 
-            # -------- CORRECT REINFORCE LOSS --------
+            # -------- REINFORCE LOSS --------
             loss = (advantage * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
@@ -93,14 +98,12 @@ def train_stage(
             sync("cuda")
 
             if is_main:
-                avg_tour = length.mean().item()
-                loss_val = loss.item()
-
                 writer.writerow([
                     step,
                     n_nodes,
-                    round(loss_val, 6),
-                    round(avg_tour, 6),
+                    round(loss.item(), 6),
+                    round(sampled_len.mean().item(), 6),
+                    round(greedy_len.mean().item(), 6),
                     round(entropy_coef, 6),
                 ])
                 f.flush()
@@ -108,7 +111,8 @@ def train_stage(
                 print(
                     f"[TRAIN][N={n_nodes}] "
                     f"step {step:05d} | "
-                    f"tour {avg_tour:.3f} | "
+                    f"sampled {sampled_len.mean():.3f} | "
+                    f"greedy {greedy_len.mean():.3f} | "
                     f"entropy {entropy_coef:.4f}"
                 )
 
@@ -117,10 +121,10 @@ def train_stage(
 
 
 # --------------------------------------------------
-# Evaluation (rank 0 only)
+# Evaluation (GREEDY ONLY, rank 0)
 # --------------------------------------------------
 @torch.no_grad()
-def evaluate(model, device, n_nodes, batch, eval_k, eval_batches):
+def evaluate(model, device, n_nodes, batch, eval_batches):
     model.eval()
     net = model.module if hasattr(model, "module") else model
 
@@ -129,18 +133,12 @@ def evaluate(model, device, n_nodes, batch, eval_k, eval_batches):
     for _ in range(eval_batches):
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
-        best = None
         start = time.perf_counter()
-
-        for _ in range(eval_k):
-            _, _, length = net.rollout(coords, greedy=False)
-            val = length.mean().item()
-            best = val if best is None else min(best, val)
-
+        _, _, length = net.rollout(coords, greedy=True)
         sync("cuda")
         end = time.perf_counter()
 
-        tours.append(best)
+        tours.append(length.mean().item())
         times.append((end - start) * 1000)
 
     return sum(tours) / len(tours), sum(times) / len(times)
@@ -155,7 +153,7 @@ def main():
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--batch", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log_every", type=int, default=10)
 
     args = parser.parse_args()
@@ -191,10 +189,10 @@ def main():
 
     # ---------------- CURRICULUM ----------------
     curriculum = [
-        dict(N=10,  steps=2000,  ent=(0.03, 0.003)),
-        dict(N=20,  steps=5000,  ent=(0.035, 0.006)),
-        dict(N=50,  steps=10000, ent=(0.04, 0.01)),
-        dict(N=100, steps=20000, ent=(0.05, 0.015)),
+        dict(N=10,  steps=1000,  ent=(0.04, 0.015)),
+        dict(N=20,  steps=3000,  ent=(0.05, 0.02)),
+        dict(N=50,  steps=5000,  ent=(0.06, 0.025)),
+        dict(N=100, steps=10000, ent=(0.07, 0.03)),
     ]
 
     for stage in curriculum:
@@ -219,6 +217,7 @@ def main():
             log_every=args.log_every,
             log_path=train_log,
             is_main=is_main,
+            entropy_floor=0.01,
             use_greedy_baseline=True,
         )
 
@@ -228,7 +227,6 @@ def main():
                 device,
                 n_nodes=N,
                 batch=args.batch,
-                eval_k=32,
                 eval_batches=20,
             )
 
