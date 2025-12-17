@@ -1,9 +1,9 @@
 # --------------------------------------------------
-# Curriculum TSP Trainer (DDP, FAST)
+# Curriculum TSP Trainer (DDP, FAST, CORRECT)
 # - SINGLE fixed-size model
 # - Curriculum over N (10 → 20 → 50 → 100)
-# - NO EMA baseline
-# - OPTIONAL Greedy baseline (recommended)
+# - Greedy baseline (NO EMA)
+# - Correct REINFORCE loss (FIXED SIGN + DETACH)
 # - Entropy regularization (training only)
 # - Sampling-only evaluation (rank 0)
 # --------------------------------------------------
@@ -22,16 +22,14 @@ from utils.device import sync
 # --------------------------------------------------
 # Entropy schedule
 # --------------------------------------------------
-
 def entropy_schedule(step, total_steps, start, end):
     frac = step / total_steps
     return start * (1 - frac) + end * frac
 
 
 # --------------------------------------------------
-# Train ONE stage
+# Train ONE curriculum stage
 # --------------------------------------------------
-
 def train_stage(
     model,
     opt,
@@ -44,7 +42,7 @@ def train_stage(
     log_every,
     log_path,
     is_main,
-    use_greedy_baseline=True,   # toggle
+    use_greedy_baseline=True,
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
@@ -52,7 +50,6 @@ def train_stage(
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
-    writer = None
     if is_main:
         f = open(log_path, "w", newline="")
         writer = csv.writer(f)
@@ -68,22 +65,24 @@ def train_stage(
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            # --- sampled rollout ---
+            # ---------------- SAMPLE POLICY ----------------
             logp, ent, length = net.rollout(coords, greedy=False)
 
-            # --- greedy baseline (NO GRAD) ---
+            # ---------------- GREEDY BASELINE ----------------
             if use_greedy_baseline:
                 with torch.no_grad():
                     _, _, greedy_len = net.rollout(coords, greedy=True)
-                advantage = length - greedy_len
+                advantage = (length - greedy_len).detach()
             else:
-                advantage = length   # pure REINFORCE
+                advantage = length.detach()
 
+            # ---------------- ENTROPY ----------------
             entropy_coef = entropy_schedule(
                 step, steps, entropy_start, entropy_end
             )
 
-            loss = (advantage * logp).mean() - entropy_coef * ent.mean()
+            # ---------------- CORRECT REINFORCE LOSS ----------------
+            loss = (advantage * (-logp)).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -120,7 +119,6 @@ def train_stage(
 # --------------------------------------------------
 # Evaluation (rank 0 only)
 # --------------------------------------------------
-
 @torch.no_grad()
 def evaluate(model, device, n_nodes, batch, eval_k, eval_batches):
     model.eval()
@@ -151,14 +149,13 @@ def evaluate(model, device, n_nodes, batch, eval_k, eval_batches):
 # --------------------------------------------------
 # Main
 # --------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--batch", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--log_every", type=int, default=10)
 
     args = parser.parse_args()
@@ -194,10 +191,10 @@ def main():
 
     # ---------------- CURRICULUM ----------------
     curriculum = [
-        dict(N=10,  steps=1000,  ent=(0.03, 0.005)),  # converge & collapse
-        dict(N=20,  steps=3000,  ent=(0.03, 0.01)),   # gentle expansion
-        dict(N=50,  steps=5000, ent=(0.04, 0.015)),  # controlled exploration
-        dict(N=100, steps=10000, ent=(0.05, 0.02)),   # scaling regime
+        dict(N=10,  steps=2000,  ent=(0.03, 0.003)),
+        dict(N=20,  steps=5000,  ent=(0.035, 0.006)),
+        dict(N=50,  steps=10000, ent=(0.04, 0.01)),
+        dict(N=100, steps=20000, ent=(0.05, 0.015)),
     ]
 
     for stage in curriculum:
@@ -222,7 +219,7 @@ def main():
             log_every=args.log_every,
             log_path=train_log,
             is_main=is_main,
-            use_greedy_baseline=True,  # keep this ON
+            use_greedy_baseline=True,
         )
 
         if is_main:
