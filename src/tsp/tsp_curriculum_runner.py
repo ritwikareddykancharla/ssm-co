@@ -3,7 +3,7 @@
 # - SINGLE fixed-size model
 # - Curriculum over N (10 → 20 → 50 → 100)
 # - Greedy baseline (NO EMA)
-# - Correct REINFORCE loss (FIXED SIGN + DETACH)
+# - CORRECT REINFORCE loss
 # - Entropy regularization (training only)
 # - Sampling-only evaluation (rank 0)
 # --------------------------------------------------
@@ -65,24 +65,25 @@ def train_stage(
         coords = torch.rand(batch, n_nodes, 2, device=device)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            # ---------------- SAMPLE POLICY ----------------
+            # -------- SAMPLE POLICY --------
             logp, ent, length = net.rollout(coords, greedy=False)
 
-            # ---------------- GREEDY BASELINE ----------------
+            # -------- GREEDY BASELINE (NO GRAD) --------
             if use_greedy_baseline:
                 with torch.no_grad():
                     _, _, greedy_len = net.rollout(coords, greedy=True)
-                advantage = (length - greedy_len).detach()
+                advantage = length - greedy_len      # ✅ DO NOT DETACH length
             else:
-                advantage = length.detach()
+                advantage = length
 
-            # ---------------- ENTROPY ----------------
+            # -------- ENTROPY --------
             entropy_coef = entropy_schedule(
                 step, steps, entropy_start, entropy_end
             )
 
-            # ---------------- CORRECT REINFORCE LOSS ----------------
-            loss = (advantage * (-logp)).mean() - entropy_coef * ent.mean()
+            # -------- CORRECT REINFORCE LOSS --------
+            # Minimize expected tour length
+            loss = (advantage * logp).mean() - entropy_coef * ent.mean()
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -109,7 +110,7 @@ def train_stage(
                     f"[TRAIN][N={n_nodes}] "
                     f"step {step:05d} | "
                     f"tour {avg_tour:.3f} | "
-                    f"entropy {entropy_coef:.3f}"
+                    f"entropy {entropy_coef:.4f}"
                 )
 
     if is_main:
