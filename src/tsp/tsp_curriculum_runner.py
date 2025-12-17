@@ -4,7 +4,7 @@
 # - Curriculum over N (10 → 20 → 50 → 100)
 # - POMO-lite baseline (same logic for ALL N, no hardcoding)
 # - CORRECT REINFORCE (ADVANTAGE * LOGP)
-# - Advantage normalization
+# - Softmax-weighted POMO advantage (NO alpha hardcoding)
 # - Entropy regularization + floor (prevents collapse)
 # - Greedy eval only (rank 0)
 # --------------------------------------------------
@@ -29,7 +29,7 @@ def entropy_schedule(step, total_steps, start, end):
 
 
 # --------------------------------------------------
-# Train ONE curriculum stage (POMO-lite)
+# Train ONE curriculum stage (POMO-lite, Option B)
 # --------------------------------------------------
 def train_stage(
     model,
@@ -45,6 +45,7 @@ def train_stage(
     is_main,
     pomo_k=4,
     entropy_floor=0.01,
+    beta=1.0,  # softmax temperature (NOT sensitive)
 ):
     model.train()
     net = model.module if hasattr(model, "module") else model
@@ -71,18 +72,18 @@ def train_stage(
             # -------- SAMPLE POLICY --------
             logp, ent, sampled_len = net.rollout(coords, greedy=False)
 
-            # -------- POMO-LITE BASELINE (NO GRAD, SAME FOR ALL N) --------
+            # -------- POMO-LITE BASELINE (NO GRAD) --------
             with torch.no_grad():
                 best_len = None
                 for _ in range(pomo_k):
                     _, _, l = net.rollout(coords, greedy=False)
                     best_len = l if best_len is None else torch.minimum(best_len, l)
 
-            advantage = sampled_len - best_len
-
-            # -------- ADVANTAGE NORMALIZATION --------
-            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
-            advantage = advantage.detach()
+            # -------- SOFTMAX-WEIGHTED ADVANTAGE (OPTION B) --------
+            delta = sampled_len - best_len                # [B]
+            weights = torch.exp(-beta * delta)
+            weights = torch.clamp(weights, max=10.0)      # safety
+            advantage = (weights * delta).detach()
 
             # -------- ENTROPY --------
             entropy_coef = entropy_schedule(step, steps, entropy_start, entropy_end)
