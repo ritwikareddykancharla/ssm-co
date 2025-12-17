@@ -106,56 +106,54 @@ class TSPModel(nn.Module):
         self.decoder = nn.ModuleList([SSMBlock(dim) for _ in range(layers)])
         self.query = nn.Linear(dim, dim)
 
+    def rollout(self, coords, greedy=False):
+        B, N, _ = coords.shape
 
-        def rollout(self, coords, greedy=False):
-            B, N, _ = coords.shape
+        node_emb = self.encoder(coords)
 
-            node_emb = self.encoder(coords)
+        start = torch.randint(0, N, (B,), device=coords.device)
 
-            start = torch.randint(0, N, (B,), device=coords.device)
+        visited = torch.zeros(B, N, dtype=torch.bool, device=coords.device)
+        visited[torch.arange(B), start] = True
 
-            visited = torch.zeros(B, N, dtype=torch.bool, device=coords.device)
-            visited[torch.arange(B), start] = True
+        current = start
+        token = node_emb[torch.arange(B), start].unsqueeze(1)
+        states = [None] * len(self.decoder)
 
-            current = start
-            token = node_emb[torch.arange(B), start].unsqueeze(1)
-            states = [None] * len(self.decoder)
+        log_probs = torch.zeros(B, device=coords.device)
+        entropies = torch.zeros(B, device=coords.device)
+        tour_len = torch.zeros(B, device=coords.device)
 
-            log_probs = torch.zeros(B, device=coords.device)
-            entropies = torch.zeros(B, device=coords.device)
-            tour_len = torch.zeros(B, device=coords.device)
+        for _ in range(N - 1):
+            h = token
+            for i, layer in enumerate(self.decoder):
+                h, states[i] = layer(h, states[i])
 
-            for _ in range(N - 1):
-                h = token
-                for i, layer in enumerate(self.decoder):
-                    h, states[i] = layer(h, states[i])
+            q = self.query(h).squeeze(1)
+            logits = torch.bmm(node_emb, q.unsqueeze(-1)).squeeze(-1)
+            logits = logits.masked_fill(visited, -1e9)
 
-                q = self.query(h).squeeze(1)
-                logits = torch.bmm(node_emb, q.unsqueeze(-1)).squeeze(-1)
+            dist = Categorical(logits=logits)
+            nxt = torch.argmax(logits, dim=-1) if greedy else dist.sample()
 
-                logits = logits.masked_fill(visited, -1e9)
-                dist = Categorical(logits=logits)
-
-                nxt = torch.argmax(logits, dim=-1) if greedy else dist.sample()
-
-                if not greedy:
-                    log_probs += dist.log_prob(nxt)
-                    entropies += dist.entropy() / N
-
-                tour_len += torch.norm(
-                    coords[torch.arange(B), current]
-                    - coords[torch.arange(B), nxt],
-                    dim=-1
-                )
-
-                visited[torch.arange(B), nxt] = True
-                current = nxt
-                token = node_emb[torch.arange(B), nxt].unsqueeze(1)
+            if not greedy:
+                log_probs += dist.log_prob(nxt)
+                entropies += dist.entropy() / N
 
             tour_len += torch.norm(
                 coords[torch.arange(B), current]
-                - coords[torch.arange(B), start],
+                - coords[torch.arange(B), nxt],
                 dim=-1
             )
 
-            return log_probs, entropies, tour_len
+            visited[torch.arange(B), nxt] = True
+            current = nxt
+            token = node_emb[torch.arange(B), nxt].unsqueeze(1)
+
+        tour_len += torch.norm(
+            coords[torch.arange(B), current]
+            - coords[torch.arange(B), start],
+            dim=-1
+        )
+
+        return log_probs, entropies, tour_len
